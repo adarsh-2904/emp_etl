@@ -15,6 +15,30 @@ def initialize_spark():
         .getOrCreate()
     return spark
 
+def check_base_and_delta_dataset(spark):
+    csv_base_file_path = "C:/Users/Exavalu/OneDrive - exavalu/airflow_practice/output_dataset/base_dataset.csv"
+    csv_delta_file_path = "C:/Users/Exavalu/OneDrive - exavalu/airflow_practice/output_dataset/delta_dataset.csv"
+
+    base_df = spark.read.csv(csv_base_file_path, header=True, inferSchema=True)
+    delta_df = spark.read.csv(csv_delta_file_path, header=True, inferSchema=True)
+
+    base_df = base_df.toDF(*[c.lower() for c in base_df.columns])
+    delta_df = delta_df.toDF(*[c.lower() for c in delta_df.columns])
+    
+    #create a temp view
+    base_df.createOrReplaceTempView("base_table")
+    delta_df.createOrReplaceTempView("delta_table")
+
+    #Perform sql operattion to find the common records between two datasets and their values (If there is any change in the values of common records )
+    changed_records = spark.sql("""
+    SELECT * FROM delta_table d
+    iNNER JOIN base_table b
+    ON d.nk_id = b.nk_id""")
+
+    changed_records.show()
+    print("changed_records count: ", changed_records.count())
+
+
 
 def extract_and_load_to_landing(spark):
     csv_file_path = "C:/Users/Exavalu/OneDrive - exavalu/airflow_practice/output_dataset/delta_dataset.csv"
@@ -322,47 +346,49 @@ def load_to_scd2dimension(spark):
      stmt = jconn.createStatement()
      expire_sql = """
                 UPDATE curated.scd2_dim_employee AS target
-                SET effective_end_date = NOW(),
-                    is_current = 0
-                FROM curated.emp_stg AS source
-                WHERE target.employee_id = source.nk_id
-                AND target.is_current = 1
-                AND (
-                    target.education IS DISTINCT FROM source.education OR
-                    target.city IS DISTINCT FROM source.city OR
-                    target.paymenttier IS DISTINCT FROM source.paymenttier OR
-                    target.age IS DISTINCT FROM source.age OR
-                    target.gender IS DISTINCT FROM source.gender OR
-                    target.everbenched IS DISTINCT FROM source.everbenched OR
-                    target.experienceincurrentdomain IS DISTINCT FROM source.experienceincurrentdomain OR
-                    target.leaveornot IS DISTINCT FROM source.leaveornot
-                );
+        SET effective_end_date = NOW(),
+            is_current = 0
+        FROM curated.emp_stg AS source
+        WHERE target.employee_id = source.nk_id
+          AND target.is_current = 1
+          AND (
+                target.education IS DISTINCT FROM source.education OR
+                target.joiningyear IS DISTINCT FROM source.joiningyear OR
+                target.city IS DISTINCT FROM source.city OR
+                target.paymenttier IS DISTINCT FROM source.paymenttier OR
+                target.age IS DISTINCT FROM source.age OR
+                target.gender IS DISTINCT FROM source.gender OR
+                target.everbenched IS DISTINCT FROM source.everbenched OR
+                target.experienceincurrentdomain IS DISTINCT FROM source.experienceincurrentdomain OR
+                target.leaveornot IS DISTINCT FROM source.leaveornot
+          );
                 """
 
      insert_sql = """
                 INSERT INTO curated.scd2_dim_employee (
-                    employee_id, education, joiningyear, city, paymenttier, age, gender,
-                    everbenched, experienceincurrentdomain, leaveornot, load_ts,
-                    effective_start_date, effective_end_date, is_current
-                )
-                SELECT
-                    source.nk_id, source.education, source.joiningyear, source.city, source.paymenttier, source.age, source.gender,
-                    source.everbenched, source.experienceincurrentdomain, source.leaveornot, source.load_ts,
-                    NOW(), NULL, 1
-                FROM curated.emp_stg AS source
-                LEFT JOIN curated.scd2_dim_employee AS target
-                ON target.employee_id = source.nk_id AND target.is_current = 1
-                WHERE target.employee_id IS NULL
-                OR (
-                        target.education IS DISTINCT FROM source.education OR
-                        target.city IS DISTINCT FROM source.city OR
-                        target.paymenttier IS DISTINCT FROM source.paymenttier OR
-                        target.age IS DISTINCT FROM source.age OR
-                        target.gender IS DISTINCT FROM source.gender OR
-                        target.everbenched IS DISTINCT FROM source.everbenched OR
-                        target.experienceincurrentdomain IS DISTINCT FROM source.experienceincurrentdomain OR
-                        target.leaveornot IS DISTINCT FROM source.leaveornot
-                );
+            employee_id, education, joiningyear, city, paymenttier, age, gender,
+            everbenched, experienceincurrentdomain, leaveornot, load_ts,
+            effective_start_date, effective_end_date, is_current
+        )
+        SELECT
+            s.nk_id, s.education, s.joiningyear, s.city, s.paymenttier, s.age, s.gender,
+            s.everbenched, s.experienceincurrentdomain, s.leaveornot, s.load_ts,
+            s.load_ts, NULL, 1
+        FROM curated.emp_stg AS s
+        LEFT JOIN curated.scd2_dim_employee AS t
+          ON t.employee_id = s.nk_id AND t.is_current = 1
+        WHERE t.employee_id IS NULL
+           OR (
+                t.education IS DISTINCT FROM s.education OR
+                t.joiningyear IS DISTINCT FROM s.joiningyear OR
+                t.city IS DISTINCT FROM s.city OR
+                t.paymenttier IS DISTINCT FROM s.paymenttier OR
+                t.age IS DISTINCT FROM s.age OR
+                t.gender IS DISTINCT FROM s.gender OR
+                t.everbenched IS DISTINCT FROM s.everbenched OR
+                t.experienceincurrentdomain IS DISTINCT FROM s.experienceincurrentdomain OR
+                t.leaveornot IS DISTINCT FROM s.leaveornot
+           );
                 """
 
      stmt.executeUpdate(expire_sql)
@@ -384,6 +410,17 @@ def load_to_scd2dimension(spark):
         """
      stmt.executeUpdate(update_cntrl_tbl)
 
+     scd2df = spark.read.format("jdbc")\
+        .option("url", jdbc_url)\
+        .option("dbtable","curated.scd2_dim_employee")\
+        .option("user", "postgres")\
+        .option("password", "root")\
+        .option("driver", "org.postgresql.Driver")\
+        .load()
+     
+     print("scd2df: ")
+     scd2df.show()
+
      stmt.close()
      jconn.close()   
 
@@ -397,6 +434,7 @@ def main():
     load_to_staging(spark)
     #load_to_curated(spark)
     load_to_scd2dimension(spark)
+    #check_base_and_delta_dataset(spark)
 
 
 if __name__ == "__main__":
