@@ -235,15 +235,41 @@ def updt_cntrl_tbl(spark,max_ts):
         stmt.close()
         jconn.close()
 
-if __name__ == "__main__":
+def history_demo(spark):
+    table = DeltaTable.forPath(spark,"C:/Users/Exavalu/OneDrive - exavalu/airflow_practice/delta_table/curated_scd2_employee")
+    history_df =table.history().select("version", "timestamp", "operation")
+    history_df.show(truncate=False)
+
+    old_table = spark.read.format("delta").option("versionAsOf",0).load("C:/Users/Exavalu/OneDrive - exavalu/airflow_practice/delta_table/curated_scd2_employee")
+    print("Old Table at version 0:")    
+    old_table.filter(old_table.employee_id.isin([2890,2387])).show()
+
+    latest_table = spark.read.format("delta").load("C:/Users/Exavalu/OneDrive - exavalu/airflow_practice/delta_table/curated_scd2_employee")
+    print("Latest Table:")  
+    latest_table.filter(latest_table.employee_id.isin([2890,2387])).show()
+
+    #restore to version 0
+    table.restoreToVersion(0)
+    restored_table = spark.read.format("delta").load("C:/Users/Exavalu/OneDrive - exavalu/airflow_practice/delta_table/curated_scd2_employee")
+    print("Restored Table to version 0:")   
+    restored_table.filter(restored_table.employee_id.isin([2890,2387])).show()
+
+def main():
     spark = initialize_spark()
     extract_and_load_to_landing(spark)
     load_to_staging(spark)
     scd2_from_staging_delta(spark)
+    history_demo(spark)
 
     #for verification purpose
     # staging_df = spark.read.format("delta").load("C:/Users/Exavalu/OneDrive - exavalu/airflow_practice/delta_table/curated_scd2_employee")
     # staging_df.filter(staging_df.employee_id.isin([2890,2387])).show()
+
+
+if __name__ == "__main__":
+    main()
+
+    
 
     
 
