@@ -1,7 +1,7 @@
 from pyspark.sql import SparkSession
 from delta import configure_spark_with_delta_pip
 from pyspark.sql.functions import to_timestamp
-from pyspark.sql.functions import col,lit
+from pyspark.sql.functions import col,lit,current_timestamp
 from delta.tables import DeltaTable
 
 def initialize_spark():
@@ -88,37 +88,162 @@ def load_to_staging(spark):
             print("staging delta table does not exist: Creating new delta table")
             emp_inc_df.write.format("delta").mode("overwrite").save(staging_path)
         
+        #comopute max load_ts to update control table later
+        max_ts_row = emp_inc_df.agg({"load_ts": "max"}).collect()
+        print("max_ts_row: ", max_ts_row)
+        max_ts = None
+        if max_ts_row and len(max_ts_row) > 0:  
+            max_ts = max_ts_row[0]["max(load_ts)"]
+            updt_cntrl_tbl(spark,max_ts)
+    except Exception as e:
+        print("Error during loading to staging:", str(e))
+
+def scd2_from_staging_delta(spark):
+    
+    try:
+        print("Loading to staging scd2...")
+
+        jdbc_url = "jdbc:postgresql://localhost:5432/etl"
+        connection_properties = {
+            "user": "postgres",
+            "password": "root",
+            "driver": "org.postgresql.Driver"
+        }
+    
+
+        cntrl_df =   spark.read.format("jdbc") \
+            .option("url", jdbc_url) \
+            .option("dbtable", "staging.contrl_tbl") \
+            .option("user", connection_properties["user"]) \
+            .option("password", connection_properties["password"]) \
+            .option("driver", connection_properties["driver"]) \
+            .load()
+
+        row_num = cntrl_df.count()
+
+        if row_num == 0:
+            print("df is none")
+            processed_ts = "1999-01-01 00:00:00"
+        else:
+            processed_ts = cntrl_df.filter(cntrl_df.table_name == "employee").select("last_processed_ts").collect()[0][0]
+        
+        print("processed_ts: ", processed_ts)
+
+        #read from landing delta table incrementally
+        src = spark.read.format("delta").load("C:/Users/Exavalu/OneDrive - exavalu/airflow_practice/delta_table/landing") \
+            .filter(col("load_ts") > to_timestamp(lit(processed_ts), "yyyy-MM-dd HH:mm:ss"))
+        print("Incremental df count: ", src.count())
+
+        #define staging path
+        scd_path = "C:/Users/Exavalu/OneDrive - exavalu/airflow_practice/delta_table/curated_scd2_employee"
+        # If SCD table does not exist, initialize it with current rows
+        initialized = False
+        if not DeltaTable.isDeltaTable(spark, scd_path):
+            init = src.withColumnRenamed("nk_id", "employee_id") \
+                    .withColumn("effective_start_date", current_timestamp()) \
+                    .withColumn("effective_end_date", lit(None).cast("timestamp")) \
+                    .withColumn("is_current", lit(True))
+            init.write.format("delta").mode("overwrite").save(scd_path)
+            print("Initialized SCD2 delta table with current rows:", init.count())
+            initialized = True
+        
+        # Normal SCD Type 2 processing (expire current, then insert new versions)
+        target = DeltaTable.forPath(spark, scd_path)
+        print("target delta table object created")
+        # 1) Expire current rows where incoming load_ts is newer
+        target.alias("t").merge(
+            src.alias("s"),
+            "t.employee_id = s.nk_id AND t.is_current = true"
+        ).whenMatchedUpdate(
+            condition="s.load_ts > t.load_ts",
+            set={
+                "effective_end_date": "current_timestamp()",
+                "is_current": "false"
+            }
+        ).execute()
+
+        print("Expired SCD2 current rows where necessary.")
+
+        # 2) Insert new versions for new keys or where source.load_ts > current.load_ts
+        current_snapshot = target.toDF().filter(col("is_current") == True).select(
+            col("employee_id").alias("t_employee_id"),
+            col("load_ts").alias("t_load_ts")
+        )
+
+        print("Current snapshot of SCD2 table prepared.")
+
+        to_insert = src.alias("s") \
+            .join(current_snapshot.alias("t"), col("s.nk_id") == col("t.t_employee_id"), "left") \
+            .filter((col("t.t_employee_id").isNull()) | (col("s.load_ts") > col("t.t_load_ts"))) \
+            .selectExpr(
+                "s.nk_id as employee_id",
+                "s.education",
+                "s.joiningyear",
+                "s.city",
+                "s.paymenttier",
+                "s.age",
+                "s.gender",
+                "s.everbenched",
+                "s.experienceincurrentdomain",
+                "s.leaveornot",
+                "s.load_ts"
+            ) \
+            .withColumn("effective_start_date", current_timestamp()) \
+            .withColumn("effective_end_date", lit(None).cast("timestamp")) \
+            .withColumn("is_current", lit(True))
+        
+        print("Prepared new SCD2 rows to insert.")
+        to_insert.write.format("delta").mode("append").save(scd_path)
+        print("Inserted SCD2 rows:", to_insert.count())
+        
+        
+        print("SCD2 upsert operation completed.")
+        #comopute max load_ts to update control table later
+        max_ts_row = src.agg({"load_ts": "max"}).collect()
+        print("max_ts_row: ", max_ts_row)
+        max_ts = None
+        if max_ts_row and len(max_ts_row) > 0:  
+            max_ts = max_ts_row[0]["max(load_ts)"]
+            updt_cntrl_tbl(spark,max_ts)
+        print("SCD2 processing completed.")
+    except Exception as e:
+        print("Error during loading to staging:", str(e))
+    
+def updt_cntrl_tbl(spark,max_ts):
+    try:
+        print("Updating control table...")
+
+        jdbc_url = "jdbc:postgresql://localhost:5432/etl"
+        connection_properties = {
+            "user": "postgres",
+            "password": "root",
+            "driver": "org.postgresql.Driver"
+        }
         #update control table
         jconn = spark._sc._jvm.java.sql.DriverManager.getConnection(jdbc_url, connection_properties["user"],connection_properties["password"])
         stmt = jconn.createStatement()
 
-        if row_num == 0:
-            update_cntrl_tbl = """
-            INSERT INTO staging.contrl_tbl(
-            table_name, last_processed_ts)
-            select 'employee' as table_name,
-            max(load_ts)
-            from staging.employee;
-        """
-        else:
-            update_cntrl_tbl = """
-                UPDATE staging.contrl_tbl
-                SET last_processed_ts = (SELECT MAX(load_ts) FROM staging.employee)
-                WHERE table_name = 'employee';
-            """
-        stmt.executeUpdate(update_cntrl_tbl)
-
+        upsert_cntrl = f"""
+                INSERT INTO staging.contrl_tbl (table_name, last_processed_ts)
+                VALUES ('employee','{max_ts}')
+                ON CONFLICT (table_name) DO UPDATE SET last_processed_ts = EXCLUDED.last_processed_ts;
+                """
+        stmt.executeUpdate(upsert_cntrl)
+    except Exception as e:
+        print("Error during updating control table:", str(e))
+    finally:
         stmt.close()
         jconn.close()
-    except Exception as e:
-        print("Error during loading to staging:", str(e))
-
-    
 
 if __name__ == "__main__":
     spark = initialize_spark()
     extract_and_load_to_landing(spark)
     load_to_staging(spark)
+    scd2_from_staging_delta(spark)
+
+    #for verification purpose
+    # staging_df = spark.read.format("delta").load("C:/Users/Exavalu/OneDrive - exavalu/airflow_practice/delta_table/curated_scd2_employee")
+    # staging_df.filter(staging_df.employee_id.isin([2890,2387])).show()
 
     
 
