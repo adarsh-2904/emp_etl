@@ -261,9 +261,9 @@ def main():
     scd2_from_staging_delta(spark)
     history_demo(spark)
 
-    for verification purpose
-    staging_df = spark.read.format("delta").load("C:/Users/Exavalu/OneDrive - exavalu/airflow_practice/delta_table/curated_scd2_employee")
-    staging_df.filter(staging_df.employee_id.isin([2890,2387])).show()
+    # for verification purpose
+    # staging_df = spark.read.format("delta").load("C:/Users/Exavalu/OneDrive - exavalu/airflow_practice/delta_table/curated_scd2_employee")
+    # staging_df.filter(staging_df.employee_id.isin([2890,2387])).show()
 
 
 if __name__ == "__main__":
